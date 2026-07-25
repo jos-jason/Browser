@@ -17,20 +17,209 @@ extension Color {
     static let settingsAccent = Color(red: 0.847, green: 0.541, blue: 0.102)
 }
 
+// MARK: - Search Engine
+
+enum SearchEngine: String, CaseIterable, Identifiable {
+    case brave = "Brave"
+    case duckduckgo = "DuckDuckGo"
+    case google = "Google"
+
+    var id: String { rawValue }
+
+    func searchURL(for query: String) -> URL? {
+        let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? query
+        switch self {
+        case .brave:
+            return URL(string: "https://search.brave.com/search?q=\(encoded)")
+        case .duckduckgo:
+            return URL(string: "https://duckduckgo.com/?q=\(encoded)")
+        case .google:
+            return URL(string: "https://www.google.com/search?q=\(encoded)")
+        }
+    }
+}
+
+// MARK: - Content Blocker
+
+@Observable
+class ContentBlocker {
+    var ruleList: WKContentRuleList?
+    var isEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(isEnabled, forKey: "adBlockingEnabled")
+        }
+    }
+
+    init() {
+        self.isEnabled = UserDefaults.standard.object(forKey: "adBlockingEnabled") as? Bool ?? true
+        compileRules()
+    }
+
+    private func compileRules() {
+        WKContentRuleListStore.default().compileContentRuleList(
+            forIdentifier: "adBlocker",
+            encodedContentRuleList: ContentBlocker.rulesJSON
+        ) { ruleList, error in
+            if let ruleList {
+                self.ruleList = ruleList
+            }
+        }
+    }
+
+    static let rulesJSON = """
+    [
+        {
+            "trigger": { "url-filter": ".*", "resource-type": ["script", "image", "raw"],
+                "if-domain": ["*doubleclick.net", "*googlesyndication.com", "*googleadservices.com",
+                    "*google-analytics.com", "*adservice.google.com", "*pagead2.googlesyndication.com",
+                    "*adnxs.com", "*adsrvr.org", "*adcolony.com", "*amazon-adsystem.com",
+                    "*moatads.com", "*scorecardresearch.com", "*quantserve.com",
+                    "*outbrain.com", "*taboola.com", "*criteo.com", "*pubmatic.com",
+                    "*rubiconproject.com", "*openx.net", "*casalemedia.com",
+                    "*sharethis.com", "*addthis.com", "*hotjar.com"]
+            },
+            "action": { "type": "block" }
+        },
+        {
+            "trigger": { "url-filter": ".*",
+                "if-domain": ["*facebook.net", "*facebook.com"],
+                "resource-type": ["script"],
+                "unless-top-url-matches": [".*facebook\\\\.com.*"]
+            },
+            "action": { "type": "block" }
+        },
+        {
+            "trigger": { "url-filter": ".*\\\\.doubleclick\\\\.net" },
+            "action": { "type": "block" }
+        },
+        {
+            "trigger": { "url-filter": ".*\\\\.googlesyndication\\\\.com" },
+            "action": { "type": "block" }
+        },
+        {
+            "trigger": { "url-filter": ".*\\\\.googleadservices\\\\.com" },
+            "action": { "type": "block" }
+        },
+        {
+            "trigger": { "url-filter": ".*\\\\.google-analytics\\\\.com" },
+            "action": { "type": "block" }
+        },
+        {
+            "trigger": { "url-filter": ".*\\\\.adnxs\\\\.com" },
+            "action": { "type": "block" }
+        },
+        {
+            "trigger": { "url-filter": ".*\\\\.amazon-adsystem\\\\.com" },
+            "action": { "type": "block" }
+        },
+        {
+            "trigger": { "url-filter": ".*\\\\.moatads\\\\.com" },
+            "action": { "type": "block" }
+        },
+        {
+            "trigger": { "url-filter": ".*\\\\.scorecardresearch\\\\.com" },
+            "action": { "type": "block" }
+        },
+        {
+            "trigger": { "url-filter": ".*\\\\.outbrain\\\\.com" },
+            "action": { "type": "block" }
+        },
+        {
+            "trigger": { "url-filter": ".*\\\\.taboola\\\\.com" },
+            "action": { "type": "block" }
+        },
+        {
+            "trigger": { "url-filter": ".*\\\\.criteo\\\\.com" },
+            "action": { "type": "block" }
+        },
+        {
+            "trigger": { "url-filter": ".*\\\\.hotjar\\\\.com" },
+            "action": { "type": "block" }
+        },
+        {
+            "trigger": { "url-filter": ".*\\\\.pubmatic\\\\.com" },
+            "action": { "type": "block" }
+        },
+        {
+            "trigger": { "url-filter": ".*pagead" },
+            "action": { "type": "block" }
+        },
+        {
+            "trigger": { "url-filter": ".*\\\\.adsrvr\\\\.org" },
+            "action": { "type": "block" }
+        },
+        {
+            "trigger": { "url-filter": ".*\\\\.quantserve\\\\.com" },
+            "action": { "type": "block" }
+        },
+        {
+            "trigger": { "url-filter": ".*", "resource-type": ["popup"] },
+            "action": { "type": "block" }
+        },
+        {
+            "trigger": { "url-filter": ".*" },
+            "action": { "type": "css-display-none", "selector": ".ad, .ads, .adsbygoogle, [id^='google_ads'], [class*='sponsored'], [data-ad], .ad-banner, .ad-container, #ad-container, .ad-wrapper, .dfp-ad, [id*='taboola'], [id*='outbrain'], .promoted-content" }
+        }
+    ]
+    """
+}
+
 // MARK: - WebView
+
+@Observable
+class WebViewNavigator {
+    weak var webView: WKWebView?
+    var canGoBack = false
+
+    func goBack() {
+        webView?.goBack()
+    }
+}
 
 struct WebView: UIViewRepresentable {
     let url: URL
+    let navigator: WebViewNavigator
+    let contentBlocker: ContentBlocker
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(navigator: navigator)
+    }
 
     func makeUIView(context: Context) -> WKWebView {
-        let webView = WKWebView()
+        let config = WKWebViewConfiguration()
+        if contentBlocker.isEnabled, let ruleList = contentBlocker.ruleList {
+            config.userContentController.add(ruleList)
+        }
+        let webView = WKWebView(frame: .zero, configuration: config)
+        webView.allowsBackForwardNavigationGestures = true
+        webView.navigationDelegate = context.coordinator
+        navigator.webView = webView
+        context.coordinator.lastRequestedURL = url
         webView.load(URLRequest(url: url))
         return webView
     }
 
     func updateUIView(_ uiView: WKWebView, context: Context) {
-        if uiView.url != url {
+        if url != context.coordinator.lastRequestedURL {
+            context.coordinator.lastRequestedURL = url
             uiView.load(URLRequest(url: url))
+        }
+    }
+
+    class Coordinator: NSObject, WKNavigationDelegate {
+        let navigator: WebViewNavigator
+        var lastRequestedURL: URL?
+
+        init(navigator: WebViewNavigator) {
+            self.navigator = navigator
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            navigator.canGoBack = webView.canGoBack
+        }
+
+        func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+            navigator.canGoBack = webView.canGoBack
         }
     }
 }
@@ -221,14 +410,23 @@ struct DotOverlay: View {
     }
 }
 
+// MARK: - Identifiable URL wrapper
+
+struct IdentifiableURL: Identifiable {
+    let id = UUID()
+    let url: URL
+}
+
 // MARK: - Content View
 
 struct ContentView: View {
     @State private var searchText = ""
-    @State private var isShowingWeb = false
     @State private var isShowingSettings = false
-    @State private var webURL: URL?
+    @State private var webItem: IdentifiableURL?
     @FocusState private var isSearchFocused: Bool
+    @AppStorage("searchEngine") private var searchEngine: String = SearchEngine.brave.rawValue
+    @State private var screenHeight: CGFloat = 0
+    @State private var contentBlocker = ContentBlocker()
 
     var body: some View {
         ZStack {
@@ -319,40 +517,52 @@ struct ContentView: View {
                             )
                     }
                 }
-                .offset(y: -UIScreen.main.bounds.height / 8)
+                .offset(y: -screenHeight / 8)
 
                 Spacer()
             }
         }
         .ignoresSafeArea(.keyboard)
-        .fullScreenCover(isPresented: $isShowingWeb) {
-            if let webURL {
-                BrowserView(url: webURL, isPresented: $isShowingWeb)
+        .overlay(
+            GeometryReader { geo in
+                Color.clear
+                    .onAppear {
+                        if screenHeight == 0 {
+                            screenHeight = geo.size.height
+                        }
+                    }
+            }
+        )
+        .fullScreenCover(item: $webItem, onDismiss: {
+            searchText = ""
+        }) { item in
+            BrowserView(url: item.url, contentBlocker: contentBlocker) {
+                webItem = nil
             }
         }
         .sheet(isPresented: $isShowingSettings) {
-            SettingsView()
+            SettingsView(contentBlocker: contentBlocker)
         }
     }
 
     private func go() {
+        isSearchFocused = false
         let trimmed = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
+        // Direct URL
         if trimmed.contains(".") && !trimmed.contains(" ") {
             let urlString = trimmed.hasPrefix("http") ? trimmed : "https://\(trimmed)"
             if let url = URL(string: urlString) {
-                webURL = url
-                isShowingWeb = true
+                webItem = IdentifiableURL(url: url)
                 return
             }
         }
 
-        // Treat as a search query
-        let query = trimmed.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? trimmed
-        if let url = URL(string: "https://www.google.com/search?q=\(query)") {
-            webURL = url
-            isShowingWeb = true
+        // Search query using selected engine
+        let engine = SearchEngine(rawValue: searchEngine) ?? .brave
+        if let url = engine.searchURL(for: trimmed) {
+            webItem = IdentifiableURL(url: url)
         }
     }
 }
@@ -361,45 +571,157 @@ struct ContentView: View {
 
 struct BrowserView: View {
     let url: URL
-    @Binding var isPresented: Bool
-    @State private var currentURL: URL?
+    let contentBlocker: ContentBlocker
+    var onDismiss: () -> Void
+
+    @State private var currentURL: URL
+    @State private var searchText = ""
+    @State private var navigator = WebViewNavigator()
+    @FocusState private var isSearchFocused: Bool
+    @AppStorage("searchEngine") private var searchEngine: String = SearchEngine.brave.rawValue
+
+    init(url: URL, contentBlocker: ContentBlocker, onDismiss: @escaping () -> Void) {
+        self.url = url
+        self.contentBlocker = contentBlocker
+        self.onDismiss = onDismiss
+        _currentURL = State(initialValue: url)
+    }
 
     var body: some View {
         ZStack {
-            Color.creamBackground
+            Color.white
                 .ignoresSafeArea()
 
             VStack(spacing: 0) {
                 // Toolbar
-                HStack {
+                HStack(spacing: 12) {
                     Button {
-                        isPresented = false
+                        if navigator.canGoBack {
+                            navigator.goBack()
+                        } else {
+                            onDismiss()
+                        }
                     } label: {
                         Image(systemName: "chevron.left")
                             .font(.title3.weight(.semibold))
-                            .foregroundStyle(Color.tealAccent)
+                            .foregroundStyle(Color.darkText.opacity(0.6))
+                    }
+
+                    if navigator.canGoBack {
+                        Button {
+                            onDismiss()
+                        } label: {
+                            Image(systemName: "xmark")
+                                .font(.body.weight(.semibold))
+                                .foregroundStyle(Color.darkText.opacity(0.6))
+                        }
                     }
 
                     Spacer()
 
-                    Text(url.host ?? "")
-                        .font(.system(size: 14, weight: .medium, design: .rounded))
-                        .foregroundStyle(Color.darkText)
+                    Text(currentURL.host ?? "")
+                        .font(.system(size: 13, weight: .medium, design: .rounded))
+                        .foregroundStyle(Color.darkText.opacity(0.6))
                         .lineLimit(1)
 
                     Spacer()
 
-                    // Invisible balance
-                    Image(systemName: "chevron.left")
-                        .font(.title3.weight(.semibold))
-                        .hidden()
+                    ShareLink(item: currentURL) {
+                        Image(systemName: "square.and.arrow.up")
+                            .font(.title3.weight(.semibold))
+                            .foregroundStyle(Color.darkText.opacity(0.6))
+                    }
                 }
                 .padding(.horizontal)
                 .padding(.vertical, 10)
-                .background(Color.creamBackground)
+                .background(.white)
 
-                WebView(url: url)
+                WebView(url: currentURL, navigator: navigator, contentBlocker: contentBlocker)
+
+                // Bottom search bar
+                HStack(spacing: 0) {
+                    TextField("Search or enter URL...", text: $searchText)
+                        .focused($isSearchFocused)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 10)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        .keyboardType(.webSearch)
+                        .submitLabel(.go)
+                        .onSubmit { goInBrowser() }
+
+                    Button { goInBrowser() } label: {
+                        Text("Go!")
+                            .font(.system(size: 14, weight: .semibold, design: .rounded))
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 18)
+                            .padding(.vertical, 10)
+                            .background(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .fill(
+                                        LinearGradient(
+                                            colors: [
+                                                Color(red: 0.50, green: 0.78, blue: 0.78),
+                                                Color(red: 0.62, green: 0.88, blue: 0.87)
+                                            ],
+                                            startPoint: .leading,
+                                            endPoint: .trailing
+                                        )
+                                    )
+                            )
+                    }
+                    .padding(.trailing, 3)
+                    .padding(.vertical, 3)
+                }
+                .background(
+                    GappedBorderWithDots(
+                        cornerRadius: 12,
+                        gap1Start: 0.05,
+                        gap2Start: 0.55,
+                        gapSize: 0.10,
+                        lineWidth: 2.5,
+                        borderColor: Color.darkText.opacity(0.75),
+                        fillColor: Color(red: 0.97, green: 0.96, blue: 0.94),
+                        drawDots: false
+                    )
+                )
+                .overlay(
+                    DotOverlay(
+                        cornerRadius: 12,
+                        gap1Start: 0.05,
+                        gap2Start: 0.55,
+                        gapSize: 0.10,
+                        dotColor: Color.darkText.opacity(0.75),
+                        inset: 6
+                    )
+                    .padding(-6)
+                    .allowsHitTesting(false)
+                )
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(.white)
             }
+        }
+    }
+
+    private func goInBrowser() {
+        isSearchFocused = false
+        let trimmed = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        if trimmed.contains(".") && !trimmed.contains(" ") {
+            let urlString = trimmed.hasPrefix("http") ? trimmed : "https://\(trimmed)"
+            if let newURL = URL(string: urlString) {
+                currentURL = newURL
+                searchText = ""
+                return
+            }
+        }
+
+        let engine = SearchEngine(rawValue: searchEngine) ?? .brave
+        if let newURL = engine.searchURL(for: trimmed) {
+            currentURL = newURL
+            searchText = ""
         }
     }
 }
@@ -408,6 +730,8 @@ struct BrowserView: View {
 
 struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
+    @AppStorage("searchEngine") private var searchEngine: String = SearchEngine.brave.rawValue
+    var contentBlocker: ContentBlocker
 
     var body: some View {
         NavigationStack {
@@ -415,23 +739,88 @@ struct SettingsView: View {
                 Color.creamBackground
                     .ignoresSafeArea()
 
-                VStack(spacing: 24) {
-                    Image(systemName: "gearshape.fill")
-                        .font(.system(size: 40))
-                        .foregroundStyle(Color.tealAccent)
+                VStack(spacing: 32) {
+                    // Search engine picker
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("Search Engine")
+                            .font(.system(size: 14, weight: .medium, design: .rounded))
+                            .foregroundStyle(Color.darkText.opacity(0.6))
+                            .textCase(.uppercase)
+                            .tracking(1)
 
-                    Text("Settings")
-                        .font(.system(size: 22, weight: .semibold, design: .rounded))
-                        .foregroundStyle(Color.darkText)
+                        ForEach(SearchEngine.allCases) { engine in
+                            Button {
+                                searchEngine = engine.rawValue
+                            } label: {
+                                HStack {
+                                    Text(engine.rawValue)
+                                        .font(.system(size: 17, weight: .medium, design: .rounded))
+                                        .foregroundStyle(Color.darkText)
 
-                    Text("Nothing here yet.")
-                        .font(.system(size: 16, design: .rounded))
-                        .foregroundStyle(Color.darkText.opacity(0.6))
+                                    Spacer()
+
+                                    if searchEngine == engine.rawValue {
+                                        Image(systemName: "checkmark")
+                                            .font(.body.weight(.semibold))
+                                            .foregroundStyle(Color.tealAccent)
+                                    }
+                                }
+                                .padding(.horizontal, 16)
+                                .padding(.vertical, 14)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 10)
+                                        .fill(searchEngine == engine.rawValue
+                                              ? Color.tealAccent.opacity(0.1)
+                                              : Color(red: 0.94, green: 0.92, blue: 0.88))
+                                )
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 10)
+                                        .stroke(searchEngine == engine.rawValue
+                                                ? Color.tealAccent.opacity(0.4)
+                                                : Color.clear, lineWidth: 1.5)
+                                )
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 20)
+
+                    // Ad blocking toggle
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("Privacy")
+                            .font(.system(size: 14, weight: .medium, design: .rounded))
+                            .foregroundStyle(Color.darkText.opacity(0.6))
+                            .textCase(.uppercase)
+                            .tracking(1)
+
+                        HStack {
+                            Text("Block Ads & Trackers")
+                                .font(.system(size: 17, weight: .medium, design: .rounded))
+                                .foregroundStyle(Color.darkText)
+
+                            Spacer()
+
+                            Toggle("", isOn: Binding(
+                                get: { contentBlocker.isEnabled },
+                                set: { contentBlocker.isEnabled = $0 }
+                            ))
+                            .tint(Color.tealAccent)
+                            .labelsHidden()
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 14)
+                        .background(
+                            RoundedRectangle(cornerRadius: 10)
+                                .fill(Color(red: 0.94, green: 0.92, blue: 0.88))
+                        )
+                    }
+                    .padding(.horizontal, 20)
 
                     Spacer()
                 }
-                .padding(.top, 40)
+                .padding(.top, 24)
             }
+            .navigationTitle("Settings")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") {
