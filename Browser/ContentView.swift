@@ -153,10 +153,6 @@ class ContentBlocker {
             "action": { "type": "block" }
         },
         {
-            "trigger": { "url-filter": ".*", "resource-type": ["popup"] },
-            "action": { "type": "block" }
-        },
-        {
             "trigger": { "url-filter": ".*" },
             "action": { "type": "css-display-none", "selector": ".ad, .ads, .adsbygoogle, [id^='google_ads'], [class*='sponsored'], [data-ad], .ad-banner, .ad-container, #ad-container, .ad-wrapper, .dfp-ad, [id*='taboola'], [id*='outbrain'], .promoted-content" }
         }
@@ -170,9 +166,14 @@ class ContentBlocker {
 class WebViewNavigator {
     weak var webView: WKWebView?
     var canGoBack = false
+    var canGoForward = false
 
     func goBack() {
         webView?.goBack()
+    }
+
+    func goForward() {
+        webView?.goForward()
     }
 }
 
@@ -221,6 +222,167 @@ struct WebView: UIViewRepresentable {
         func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
             navigator.canGoBack = webView.canGoBack
         }
+    }
+}
+
+// MARK: - Browser Tab
+
+@Observable
+class BrowserTab: Identifiable {
+    let id = UUID()
+    var currentURL: URL
+    var title: String = ""
+    var snapshot: UIImage?
+    let navigator: WebViewNavigator
+    let webView: WKWebView
+    let delegate: BrowserTabDelegate
+
+    init(url: URL, contentBlocker: ContentBlocker) {
+        self.currentURL = url
+        self.navigator = WebViewNavigator()
+
+        let config = WKWebViewConfiguration()
+        config.preferences.javaScriptCanOpenWindowsAutomatically = true
+        if contentBlocker.isEnabled, let ruleList = contentBlocker.ruleList {
+            config.userContentController.add(ruleList)
+        }
+        let wk = WKWebView(frame: .zero, configuration: config)
+        wk.allowsBackForwardNavigationGestures = true
+        self.webView = wk
+        self.navigator.webView = wk
+
+        let del = BrowserTabDelegate()
+        self.delegate = del
+        wk.navigationDelegate = del
+        wk.uiDelegate = del
+
+        // Set back-reference so delegate can update this tab
+        del.tab = self
+
+        wk.load(URLRequest(url: url))
+    }
+
+    func captureSnapshot() {
+        let config = WKSnapshotConfiguration()
+        webView.takeSnapshot(with: config) { image, _ in
+            if let image {
+                self.snapshot = image
+            }
+        }
+    }
+}
+
+// Delegate owned by BrowserTab so it's active from the moment the web view is created
+class BrowserTabDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
+    weak var tab: BrowserTab?
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard let tab else { return }
+        tab.navigator.canGoBack = webView.canGoBack
+        tab.navigator.canGoForward = webView.canGoForward
+        tab.currentURL = webView.url ?? tab.currentURL
+        tab.title = webView.title ?? ""
+    }
+
+    func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        guard let tab else { return }
+        tab.navigator.canGoBack = webView.canGoBack
+        tab.navigator.canGoForward = webView.canGoForward
+        tab.currentURL = webView.url ?? tab.currentURL
+    }
+
+    // Upgrade http:// to https:// to satisfy App Transport Security
+    private func upgradeToHTTPS(_ url: URL) -> URL {
+        if url.scheme == "http", var components = URLComponents(url: url, resolvingAgainstBaseURL: true) {
+            components.scheme = "https"
+            return components.url ?? url
+        }
+        return url
+    }
+
+    // Handle regular navigation — upgrade insecure URLs
+    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        if let url = navigationAction.request.url, url.scheme == "http" {
+            decisionHandler(.cancel)
+            webView.load(URLRequest(url: upgradeToHTTPS(url)))
+            return
+        }
+        decisionHandler(.allow)
+    }
+
+    // Handle window.open() and target="_blank" links
+    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+        if let url = navigationAction.request.url {
+            webView.load(URLRequest(url: upgradeToHTTPS(url)))
+        }
+        return nil
+    }
+}
+
+// MARK: - Tab Manager
+
+@Observable
+class TabManager {
+    static let maxTabs = 20
+
+    var tabs: [BrowserTab] = []
+    var activeTabID: UUID?
+    var showTabSwitcher = false
+
+    var activeTab: BrowserTab? {
+        guard let id = activeTabID else { return nil }
+        return tabs.first { $0.id == id }
+    }
+
+    var tabCount: Int { tabs.count }
+    var canAddTab: Bool { tabs.count < Self.maxTabs }
+
+    func addTab(url: URL, contentBlocker: ContentBlocker) {
+        guard canAddTab else { return }
+        let tab = BrowserTab(url: url, contentBlocker: contentBlocker)
+        tabs.append(tab)
+        activeTabID = tab.id
+    }
+
+    func closeTab(_ tab: BrowserTab) {
+        guard let index = tabs.firstIndex(where: { $0.id == tab.id }) else { return }
+        tabs.remove(at: index)
+
+        if activeTabID == tab.id {
+            if tabs.isEmpty {
+                activeTabID = nil
+            } else {
+                let newIndex = min(index, tabs.count - 1)
+                activeTabID = tabs[newIndex].id
+            }
+        }
+    }
+
+    func switchTo(_ tab: BrowserTab) {
+        // Capture snapshot of current tab before switching
+        activeTab?.captureSnapshot()
+        activeTabID = tab.id
+        showTabSwitcher = false
+    }
+
+    func captureAllSnapshots() {
+        for tab in tabs {
+            tab.captureSnapshot()
+        }
+    }
+}
+
+// MARK: - Tab Web View
+
+struct TabWebView: UIViewRepresentable {
+    let tab: BrowserTab
+
+    func makeUIView(context: Context) -> WKWebView {
+        return tab.webView
+    }
+
+    func updateUIView(_ uiView: WKWebView, context: Context) {
+        // Navigation is handled by the BrowserTab's delegate
     }
 }
 
@@ -570,21 +732,20 @@ struct ContentView: View {
 // MARK: - Browser View
 
 struct BrowserView: View {
-    let url: URL
+    let initialURL: URL
     let contentBlocker: ContentBlocker
     var onDismiss: () -> Void
 
-    @State private var currentURL: URL
+    @State private var tabManager = TabManager()
     @State private var searchText = ""
-    @State private var navigator = WebViewNavigator()
     @FocusState private var isSearchFocused: Bool
     @AppStorage("searchEngine") private var searchEngine: String = SearchEngine.brave.rawValue
+    @AppStorage("researchMode") private var researchMode = false
 
     init(url: URL, contentBlocker: ContentBlocker, onDismiss: @escaping () -> Void) {
-        self.url = url
+        self.initialURL = url
         self.contentBlocker = contentBlocker
         self.onDismiss = onDismiss
-        _currentURL = State(initialValue: url)
     }
 
     var body: some View {
@@ -592,137 +753,551 @@ struct BrowserView: View {
             Color.white
                 .ignoresSafeArea()
 
-            VStack(spacing: 0) {
-                // Toolbar
-                HStack(spacing: 12) {
-                    Button {
-                        if navigator.canGoBack {
-                            navigator.goBack()
-                        } else {
-                            onDismiss()
-                        }
-                    } label: {
-                        Image(systemName: "chevron.left")
-                            .font(.title3.weight(.semibold))
-                            .foregroundStyle(Color.darkText.opacity(0.6))
+            if let activeTab = tabManager.activeTab {
+                VStack(spacing: 0) {
+                    topToolbar(tab: activeTab)
+
+                    TabWebView(tab: activeTab)
+                        .id(activeTab.id)
+
+                    if researchMode {
+                        tabStrip()
                     }
 
-                    if navigator.canGoBack {
-                        Button {
-                            onDismiss()
-                        } label: {
-                            Image(systemName: "xmark")
-                                .font(.body.weight(.semibold))
-                                .foregroundStyle(Color.darkText.opacity(0.6))
-                        }
-                    }
-
-                    Spacer()
-
-                    Text(currentURL.host ?? "")
-                        .font(.system(size: 13, weight: .medium, design: .rounded))
-                        .foregroundStyle(Color.darkText.opacity(0.6))
-                        .lineLimit(1)
-
-                    Spacer()
-
-                    ShareLink(item: currentURL) {
-                        Image(systemName: "square.and.arrow.up")
-                            .font(.title3.weight(.semibold))
-                            .foregroundStyle(Color.darkText.opacity(0.6))
-                    }
+                    bottomSearchBar(tab: activeTab)
                 }
-                .padding(.horizontal)
-                .padding(.vertical, 10)
-                .background(.white)
-
-                WebView(url: currentURL, navigator: navigator, contentBlocker: contentBlocker)
-
-                // Bottom search bar
-                HStack(spacing: 0) {
-                    TextField("Search or enter URL...", text: $searchText)
-                        .focused($isSearchFocused)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 10)
-                        .autocorrectionDisabled()
-                        .textInputAutocapitalization(.never)
-                        .keyboardType(.webSearch)
-                        .submitLabel(.go)
-                        .onSubmit { goInBrowser() }
-
-                    Button { goInBrowser() } label: {
-                        Text("Go!")
-                            .font(.system(size: 14, weight: .semibold, design: .rounded))
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 18)
-                            .padding(.vertical, 10)
-                            .background(
-                                RoundedRectangle(cornerRadius: 8)
-                                    .fill(
-                                        LinearGradient(
-                                            colors: [
-                                                Color(red: 0.50, green: 0.78, blue: 0.78),
-                                                Color(red: 0.62, green: 0.88, blue: 0.87)
-                                            ],
-                                            startPoint: .leading,
-                                            endPoint: .trailing
-                                        )
-                                    )
-                            )
-                    }
-                    .padding(.trailing, 3)
-                    .padding(.vertical, 3)
-                }
-                .background(
-                    GappedBorderWithDots(
-                        cornerRadius: 12,
-                        gap1Start: 0.05,
-                        gap2Start: 0.55,
-                        gapSize: 0.10,
-                        lineWidth: 2.5,
-                        borderColor: Color.darkText.opacity(0.75),
-                        fillColor: Color(red: 0.97, green: 0.96, blue: 0.94),
-                        drawDots: false
-                    )
-                )
-                .overlay(
-                    DotOverlay(
-                        cornerRadius: 12,
-                        gap1Start: 0.05,
-                        gap2Start: 0.55,
-                        gapSize: 0.10,
-                        dotColor: Color.darkText.opacity(0.75),
-                        inset: 6
-                    )
-                    .padding(-6)
-                    .allowsHitTesting(false)
-                )
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .background(.white)
+            }
+        }
+        .onAppear {
+            if tabManager.tabs.isEmpty {
+                tabManager.addTab(url: initialURL, contentBlocker: contentBlocker)
+            }
+        }
+        .overlay {
+            if researchMode && tabManager.showTabSwitcher {
+                tabSwitcherOverlay()
             }
         }
     }
 
-    private func goInBrowser() {
+    // MARK: - Top Toolbar
+
+    @ViewBuilder
+    private func topToolbar(tab: BrowserTab) -> some View {
+        HStack(spacing: 12) {
+            Button {
+                if tab.navigator.canGoBack {
+                    tab.navigator.goBack()
+                } else if tabManager.tabCount == 1 {
+                    onDismiss()
+                } else {
+                    tabManager.closeTab(tab)
+                }
+            } label: {
+                Image(systemName: "chevron.left")
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(Color.darkText.opacity(0.6))
+            }
+
+            if tab.navigator.canGoBack || tabManager.tabCount > 1 {
+                Button {
+                    if tabManager.tabCount == 1 {
+                        onDismiss()
+                    } else {
+                        tabManager.closeTab(tab)
+                        if tabManager.tabs.isEmpty {
+                            onDismiss()
+                        }
+                    }
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.body.weight(.semibold))
+                        .foregroundStyle(Color.darkText.opacity(0.6))
+                }
+            }
+
+            if tab.navigator.canGoForward {
+                Button {
+                    tab.navigator.goForward()
+                } label: {
+                    Image(systemName: "chevron.right")
+                        .font(.title3.weight(.semibold))
+                        .foregroundStyle(Color.darkText.opacity(0.6))
+                }
+            }
+
+            Button {
+                tab.webView.reload()
+            } label: {
+                Image(systemName: "arrow.clockwise")
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(Color.darkText.opacity(0.6))
+            }
+
+            Spacer()
+
+            Text(tab.currentURL.host ?? "")
+                .font(.system(size: 13, weight: .medium, design: .rounded))
+                .foregroundStyle(Color.darkText.opacity(0.6))
+                .lineLimit(1)
+
+            Spacer()
+
+            if researchMode {
+                // Tab count button
+                Button {
+                    tabManager.captureAllSnapshots()
+                    tabManager.showTabSwitcher.toggle()
+                } label: {
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 5)
+                            .stroke(Color.darkText.opacity(0.6), lineWidth: 1.5)
+                            .frame(width: 22, height: 22)
+                        Text("\(tabManager.tabCount)")
+                            .font(.system(size: 12, weight: .bold, design: .rounded))
+                            .foregroundStyle(Color.darkText.opacity(0.6))
+                    }
+                }
+            }
+
+            ShareLink(item: tab.currentURL) {
+                Image(systemName: "square.and.arrow.up")
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(Color.darkText.opacity(0.6))
+            }
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 10)
+        .background(.white)
+    }
+
+    // MARK: - Tab Strip
+
+    @ViewBuilder
+    private func tabStrip() -> some View {
+        ScrollViewReader { proxy in
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    ForEach(tabManager.tabs) { tab in
+                        tabPill(tab: tab)
+                            .id(tab.id)
+                    }
+
+                    if tabManager.canAddTab {
+                        Button {
+                            let engine = SearchEngine(rawValue: searchEngine) ?? .brave
+                            let homeURL = engine.searchURL(for: "")
+                                ?? URL(string: "https://search.brave.com")!
+                            tabManager.addTab(url: homeURL, contentBlocker: contentBlocker)
+                        } label: {
+                            Image(systemName: "plus")
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundStyle(Color.tealAccent)
+                                .frame(width: 32, height: 28)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 8)
+                                        .fill(Color.tealAccent.opacity(0.1))
+                                )
+                        }
+                    }
+                }
+                .padding(.horizontal, 12)
+            }
+            .onChange(of: tabManager.activeTabID) { _, newID in
+                if let newID {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        proxy.scrollTo(newID, anchor: .center)
+                    }
+                }
+            }
+        }
+        .frame(height: 40)
+        .background(Color(red: 0.97, green: 0.96, blue: 0.94))
+    }
+
+    @ViewBuilder
+    private func tabPill(tab: BrowserTab) -> some View {
+        let isActive = tab.id == tabManager.activeTabID
+
+        Button {
+            tabManager.switchTo(tab)
+        } label: {
+            HStack(spacing: 4) {
+                Text(tab.title.isEmpty ? (tab.currentURL.host ?? "New Tab") : tab.title)
+                    .font(.system(size: 12, weight: .medium, design: .rounded))
+                    .lineLimit(1)
+                    .foregroundStyle(isActive ? Color.white : Color.darkText.opacity(0.7))
+                    .frame(maxWidth: 100)
+
+                if tabManager.tabCount > 1 {
+                    Button {
+                        tabManager.closeTab(tab)
+                        if tabManager.tabs.isEmpty {
+                            onDismiss()
+                        }
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundStyle(isActive ? Color.white.opacity(0.7) : Color.darkText.opacity(0.4))
+                    }
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            .background(
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(isActive ? Color.tealAccent : Color.white.opacity(0.8))
+            )
+        }
+    }
+
+    // MARK: - Tab Switcher Overlay
+
+    @ViewBuilder
+    private func tabSwitcherOverlay() -> some View {
+        ZStack {
+            Color(red: 0.97, green: 0.96, blue: 0.94).ignoresSafeArea()
+
+            VStack(spacing: 0) {
+                HStack {
+                    Text("Tabs")
+                        .font(.system(size: 20, weight: .bold, design: .rounded))
+                        .foregroundStyle(Color.darkText)
+
+                    Spacer()
+
+                    if tabManager.canAddTab {
+                        Button {
+                            let engine = SearchEngine(rawValue: searchEngine) ?? .brave
+                            let homeURL = engine.searchURL(for: "")
+                                ?? URL(string: "https://search.brave.com")!
+                            tabManager.addTab(url: homeURL, contentBlocker: contentBlocker)
+                        } label: {
+                            Image(systemName: "plus")
+                                .font(.title3.weight(.semibold))
+                                .foregroundStyle(Color.tealAccent)
+                        }
+                    }
+
+                    Button {
+                        tabManager.showTabSwitcher = false
+                    } label: {
+                        Text("Done")
+                            .font(.system(size: 17, weight: .medium, design: .rounded))
+                            .foregroundStyle(Color.tealAccent)
+                    }
+                }
+                .padding()
+
+
+
+                ScrollView {
+                    LazyVGrid(columns: [
+                        GridItem(.flexible(), spacing: 12),
+                        GridItem(.flexible(), spacing: 12)
+                    ], spacing: 12) {
+                        ForEach(tabManager.tabs) { tab in
+                            tabCard(tab: tab)
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 8)
+                    .padding(.bottom, 16)
+                }
+
+                // Bottom search bar
+                tabSwitcherSearchBar()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func tabSwitcherSearchBar() -> some View {
+        HStack(spacing: 0) {
+            TextField("Search or enter URL...", text: $searchText)
+                .focused($isSearchFocused)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .autocorrectionDisabled()
+                .textInputAutocapitalization(.never)
+                .keyboardType(.webSearch)
+                .submitLabel(.go)
+                .onSubmit { goInNewTab() }
+
+            Button { goInNewTab() } label: {
+                Text("Go!")
+                    .font(.system(size: 14, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 10)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(
+                                LinearGradient(
+                                    colors: [
+                                        Color(red: 0.50, green: 0.78, blue: 0.78),
+                                        Color(red: 0.62, green: 0.88, blue: 0.87)
+                                    ],
+                                    startPoint: .leading,
+                                    endPoint: .trailing
+                                )
+                            )
+                    )
+            }
+            .padding(.trailing, 3)
+            .padding(.vertical, 3)
+        }
+        .background(
+            GappedBorderWithDots(
+                cornerRadius: 12,
+                gap1Start: 0.05,
+                gap2Start: 0.55,
+                gapSize: 0.10,
+                lineWidth: 2.5,
+                borderColor: Color.darkText.opacity(0.75),
+                fillColor: Color(red: 0.97, green: 0.96, blue: 0.94),
+                drawDots: false
+            )
+        )
+        .overlay(
+            DotOverlay(
+                cornerRadius: 12,
+                gap1Start: 0.05,
+                gap2Start: 0.55,
+                gapSize: 0.10,
+                dotColor: Color.darkText.opacity(0.75),
+                inset: 6
+            )
+            .padding(-6)
+            .allowsHitTesting(false)
+        )
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color(red: 0.97, green: 0.96, blue: 0.94))
+    }
+
+    private func goInNewTab() {
+        isSearchFocused = false
+        let trimmed = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        guard tabManager.canAddTab else { return }
+
+        var targetURL: URL?
+
+        if trimmed.contains(".") && !trimmed.contains(" ") {
+            let urlString = trimmed.hasPrefix("http") ? trimmed : "https://\(trimmed)"
+            targetURL = URL(string: urlString)
+        }
+
+        if targetURL == nil {
+            let engine = SearchEngine(rawValue: searchEngine) ?? .brave
+            targetURL = engine.searchURL(for: trimmed)
+        }
+
+        if let url = targetURL {
+            tabManager.addTab(url: url, contentBlocker: contentBlocker)
+            searchText = ""
+        }
+    }
+
+    @ViewBuilder
+    private func tabCard(tab: BrowserTab) -> some View {
+        let isActive = tab.id == tabManager.activeTabID
+
+        Button {
+            tabManager.switchTo(tab)
+        } label: {
+            VStack(spacing: 0) {
+                // Tab title bar
+                HStack {
+                    Text(tab.title.isEmpty ? (tab.currentURL.host ?? "New Tab") : tab.title)
+                        .font(.system(size: 12, weight: .semibold, design: .rounded))
+                        .foregroundStyle(Color.darkText)
+                        .lineLimit(1)
+                    Spacer()
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(isActive ? Color.tealAccent.opacity(0.1) : Color(red: 0.97, green: 0.96, blue: 0.94))
+
+                // Snapshot preview
+                if let snapshot = tab.snapshot {
+                    Image(uiImage: snapshot)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                        .frame(height: 140)
+                        .clipped()
+                } else {
+                    Rectangle()
+                        .fill(Color.white)
+                        .frame(height: 140)
+                        .overlay {
+                            VStack(spacing: 4) {
+                                Image(systemName: "globe")
+                                    .font(.title3)
+                                    .foregroundStyle(Color.darkText.opacity(0.2))
+                                Text(tab.currentURL.host ?? "")
+                                    .font(.system(size: 11, weight: .regular, design: .rounded))
+                                    .foregroundStyle(Color.darkText.opacity(0.3))
+                            }
+                        }
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+            .overlay(
+                RoundedRectangle(cornerRadius: 12)
+                    .stroke(isActive ? Color.tealAccent : Color.darkText.opacity(0.15),
+                            lineWidth: isActive ? 2 : 1)
+            )
+            .shadow(color: Color.black.opacity(0.06), radius: 4, y: 2)
+            .overlay(alignment: .topTrailing) {
+                Button {
+                    tabManager.closeTab(tab)
+                    if tabManager.tabs.isEmpty {
+                        onDismiss()
+                    }
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 22))
+                        .foregroundStyle(Color.darkText.opacity(0.4))
+                        .background(Circle().fill(Color.white))
+                }
+                .offset(x: 6, y: -6)
+            }
+        }
+    }
+
+    // MARK: - Bottom Search Bar
+
+    @ViewBuilder
+    private func bottomSearchBar(tab: BrowserTab) -> some View {
+        HStack(spacing: 0) {
+            TextField("Search or enter URL...", text: $searchText)
+                .focused($isSearchFocused)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .autocorrectionDisabled()
+                .textInputAutocapitalization(.never)
+                .keyboardType(.webSearch)
+                .submitLabel(.go)
+                .onSubmit { goInBrowser(tab: tab) }
+
+            Button { goInBrowser(tab: tab) } label: {
+                Text("Go!")
+                    .font(.system(size: 14, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 10)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(
+                                LinearGradient(
+                                    colors: [
+                                        Color(red: 0.50, green: 0.78, blue: 0.78),
+                                        Color(red: 0.62, green: 0.88, blue: 0.87)
+                                    ],
+                                    startPoint: .leading,
+                                    endPoint: .trailing
+                                )
+                            )
+                    )
+            }
+            .padding(.trailing, 3)
+            .padding(.vertical, 3)
+        }
+        .background(
+            GappedBorderWithDots(
+                cornerRadius: 12,
+                gap1Start: 0.05,
+                gap2Start: 0.55,
+                gapSize: 0.10,
+                lineWidth: 2.5,
+                borderColor: Color.darkText.opacity(0.75),
+                fillColor: Color(red: 0.97, green: 0.96, blue: 0.94),
+                drawDots: false
+            )
+        )
+        .overlay(
+            DotOverlay(
+                cornerRadius: 12,
+                gap1Start: 0.05,
+                gap2Start: 0.55,
+                gapSize: 0.10,
+                dotColor: Color.darkText.opacity(0.75),
+                inset: 6
+            )
+            .padding(-6)
+            .allowsHitTesting(false)
+        )
+        .padding(.horizontal, 12)
+        .padding(.top, 2)
+        .padding(.bottom, 8)
+        .background(.white)
+    }
+
+    // MARK: - Navigation
+
+    private func goInBrowser(tab: BrowserTab) {
         isSearchFocused = false
         let trimmed = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
+        var targetURL: URL?
+
         if trimmed.contains(".") && !trimmed.contains(" ") {
             let urlString = trimmed.hasPrefix("http") ? trimmed : "https://\(trimmed)"
-            if let newURL = URL(string: urlString) {
-                currentURL = newURL
-                searchText = ""
-                return
-            }
+            targetURL = URL(string: urlString)
         }
 
-        let engine = SearchEngine(rawValue: searchEngine) ?? .brave
-        if let newURL = engine.searchURL(for: trimmed) {
-            currentURL = newURL
+        if targetURL == nil {
+            let engine = SearchEngine(rawValue: searchEngine) ?? .brave
+            targetURL = engine.searchURL(for: trimmed)
+        }
+
+        if let url = targetURL {
+            tab.webView.load(URLRequest(url: url))
             searchText = ""
         }
+    }
+}
+
+// MARK: - App Icon
+
+enum AppIconOption: String, CaseIterable, Identifiable {
+    case primary = "Default"
+    case dark = "Dark"
+    case tinted = "Tinted"
+    case alt1 = "Ocean"
+    case alt2 = "Sunset"
+
+    var id: String { rawValue }
+
+    /// The alternate icon name registered in Info.plist, or nil for the primary icon
+    var alternateIconName: String? {
+        switch self {
+        case .primary: return nil
+        case .dark: return "AppIcon-Dark"
+        case .tinted: return "AppIcon-Tinted"
+        case .alt1: return "AppIcon-Alt1"
+        case .alt2: return "AppIcon-Alt2"
+        }
+    }
+
+    /// The filename of the preview image in the bundle
+    var previewImageName: String {
+        switch self {
+        case .primary: return "AppIcon-Primary"
+        case .dark: return "AppIcon-Dark"
+        case .tinted: return "AppIcon-Tinted"
+        case .alt1: return "AppIcon-Alt1"
+        case .alt2: return "AppIcon-Alt2"
+        }
+    }
+
+    /// Returns the currently active icon option
+    static var current: AppIconOption {
+        let name = UIApplication.shared.alternateIconName
+        return allCases.first { $0.alternateIconName == name } ?? .primary
     }
 }
 
@@ -731,6 +1306,8 @@ struct BrowserView: View {
 struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @AppStorage("searchEngine") private var searchEngine: String = SearchEngine.brave.rawValue
+    @AppStorage("researchMode") private var researchMode = false
+    @State private var currentIcon: AppIconOption = AppIconOption.current
     var contentBlocker: ContentBlocker
 
     var body: some View {
@@ -739,7 +1316,64 @@ struct SettingsView: View {
                 Color.creamBackground
                     .ignoresSafeArea()
 
+                ScrollView {
                 VStack(spacing: 32) {
+                    // App Icon picker
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("App Icon")
+                            .font(.system(size: 14, weight: .medium, design: .rounded))
+                            .foregroundStyle(Color.darkText.opacity(0.6))
+                            .textCase(.uppercase)
+                            .tracking(1)
+
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 14) {
+                                ForEach(AppIconOption.allCases) { icon in
+                                    Button {
+                                        setAppIcon(icon)
+                                    } label: {
+                                        VStack(spacing: 8) {
+                                            if let uiImage = UIImage(named: icon.previewImageName) {
+                                                Image(uiImage: uiImage)
+                                                    .resizable()
+                                                    .aspectRatio(contentMode: .fill)
+                                                    .frame(width: 64, height: 64)
+                                                    .clipShape(RoundedRectangle(cornerRadius: 14))
+                                            } else {
+                                                RoundedRectangle(cornerRadius: 14)
+                                                    .fill(Color.darkText.opacity(0.1))
+                                                    .frame(width: 64, height: 64)
+                                                    .overlay {
+                                                        Image(systemName: "app.fill")
+                                                            .foregroundStyle(Color.darkText.opacity(0.3))
+                                                    }
+                                            }
+
+                                            Text(icon.rawValue)
+                                                .font(.system(size: 12, weight: .medium, design: .rounded))
+                                                .foregroundStyle(Color.darkText)
+                                        }
+                                        .padding(8)
+                                        .background(
+                                            RoundedRectangle(cornerRadius: 16)
+                                                .fill(currentIcon == icon
+                                                      ? Color.tealAccent.opacity(0.1)
+                                                      : Color.clear)
+                                        )
+                                        .overlay(
+                                            RoundedRectangle(cornerRadius: 16)
+                                                .stroke(currentIcon == icon
+                                                        ? Color.tealAccent
+                                                        : Color.clear, lineWidth: 2)
+                                        )
+                                    }
+                                }
+                            }
+                            .padding(.horizontal, 4)
+                        }
+                    }
+                    .padding(.horizontal, 20)
+
                     // Search engine picker
                     VStack(alignment: .leading, spacing: 12) {
                         Text("Search Engine")
@@ -784,6 +1418,39 @@ struct SettingsView: View {
                     }
                     .padding(.horizontal, 20)
 
+                    // Research mode toggle
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("Browsing")
+                            .font(.system(size: 14, weight: .medium, design: .rounded))
+                            .foregroundStyle(Color.darkText.opacity(0.6))
+                            .textCase(.uppercase)
+                            .tracking(1)
+
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Research Mode")
+                                    .font(.system(size: 17, weight: .medium, design: .rounded))
+                                    .foregroundStyle(Color.darkText)
+                                Text("Open up to 20 tabs")
+                                    .font(.system(size: 13, weight: .regular, design: .rounded))
+                                    .foregroundStyle(Color.darkText.opacity(0.5))
+                            }
+
+                            Spacer()
+
+                            Toggle("", isOn: $researchMode)
+                                .tint(Color.tealAccent)
+                                .labelsHidden()
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 14)
+                        .background(
+                            RoundedRectangle(cornerRadius: 10)
+                                .fill(Color(red: 0.94, green: 0.92, blue: 0.88))
+                        )
+                    }
+                    .padding(.horizontal, 20)
+
                     // Ad blocking toggle
                     VStack(alignment: .leading, spacing: 12) {
                         Text("Privacy")
@@ -815,9 +1482,10 @@ struct SettingsView: View {
                     }
                     .padding(.horizontal, 20)
 
-                    Spacer()
                 }
                 .padding(.top, 24)
+                .padding(.bottom, 32)
+                }
             }
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
@@ -828,6 +1496,15 @@ struct SettingsView: View {
                     }
                     .foregroundStyle(Color.tealAccent)
                 }
+            }
+        }
+    }
+
+    private func setAppIcon(_ icon: AppIconOption) {
+        guard currentIcon != icon else { return }
+        UIApplication.shared.setAlternateIconName(icon.alternateIconName) { error in
+            if error == nil {
+                currentIcon = icon
             }
         }
     }
