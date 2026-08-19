@@ -7,6 +7,7 @@
 
 import SwiftUI
 import WebKit
+import Photos
 
 // MARK: - Color Palette
 
@@ -243,6 +244,8 @@ class BrowserTab: Identifiable {
 
         let config = WKWebViewConfiguration()
         config.preferences.javaScriptCanOpenWindowsAutomatically = true
+        config.allowsInlineMediaPlayback = true
+        config.mediaTypesRequiringUserActionForPlayback = .all
         if contentBlocker.isEnabled, let ruleList = contentBlocker.ruleList {
             config.userContentController.add(ruleList)
         }
@@ -273,7 +276,7 @@ class BrowserTab: Identifiable {
 }
 
 // Delegate owned by BrowserTab so it's active from the moment the web view is created
-class BrowserTabDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
+class BrowserTabDelegate: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate {
     weak var tab: BrowserTab?
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -310,12 +313,68 @@ class BrowserTabDelegate: NSObject, WKNavigationDelegate, WKUIDelegate {
         decisionHandler(.allow)
     }
 
+    // Convert non-renderable responses (e.g. Content-Disposition: attachment) into downloads
+    func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse, decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+        if !navigationResponse.canShowMIMEType {
+            decisionHandler(.download)
+            return
+        }
+        decisionHandler(.allow)
+    }
+
+    // A navigation action became a download
+    func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
+        download.delegate = self
+    }
+
+    // A navigation response became a download
+    func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
+        download.delegate = self
+    }
+
     // Handle window.open() and target="_blank" links
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
         if let url = navigationAction.request.url {
             webView.load(URLRequest(url: upgradeToHTTPS(url)))
         }
         return nil
+    }
+
+    // MARK: - WKDownloadDelegate
+
+    func download(_ download: WKDownload, decideDestinationUsing response: URLResponse, suggestedFilename: String, completionHandler: @escaping (URL?) -> Void) {
+        let tempDir = FileManager.default.temporaryDirectory
+        let destination = tempDir.appendingPathComponent(suggestedFilename)
+        // Remove any existing file at the destination
+        try? FileManager.default.removeItem(at: destination)
+        completionHandler(destination)
+    }
+
+    func downloadDidFinish(_ download: WKDownload) {
+        guard let url = download.originalRequest?.url else { return }
+
+        // Build the file path from the suggested filename used during download
+        let suggestedFilename = url.lastPathComponent
+        let tempFile = FileManager.default.temporaryDirectory.appendingPathComponent(suggestedFilename)
+
+        // Check if the file is an image by its UTI
+        guard FileManager.default.fileExists(atPath: tempFile.path) else { return }
+
+        PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
+            guard status == .authorized || status == .limited else { return }
+
+            PHPhotoLibrary.shared().performChanges {
+                let request = PHAssetCreationRequest.forAsset()
+                request.addResource(with: .photo, fileURL: tempFile, options: nil)
+            } completionHandler: { success, _ in
+                // Clean up temp file regardless of outcome
+                try? FileManager.default.removeItem(at: tempFile)
+            }
+        }
+    }
+
+    func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
+        // Download failed — nothing to do
     }
 }
 
