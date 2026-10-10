@@ -417,13 +417,8 @@ struct GestureCanvasView: View {
 
     @State private var points: [CGPoint] = []
     @State private var isDrawing = false
-    @State private var recognizedShortcut: GestureShortcut? = nil
     @State private var trailOpacity: Double = 1.0
-    @State private var showResult = false
-    @State private var resultScale: CGFloat = 0.5
     @State private var recognizer = QRecognizer()
-
-    @AppStorage("gestureQuickNavigate") private var quickNavigate = false
 
     // Turquoise sparkle color
     private let trailColor = Color(red: 0.35, green: 0.72, blue: 0.68)
@@ -440,8 +435,6 @@ struct GestureCanvasView: View {
                             .onChanged { value in
                                 if !isDrawing {
                                     points = []
-                                    recognizedShortcut = nil
-                                    showResult = false
                                     trailOpacity = 1.0
                                     isDrawing = true
                                 }
@@ -453,29 +446,13 @@ struct GestureCanvasView: View {
                                 // Ignore taps and tiny scribbles
                                 if points.count >= 15, let match = recognizer.recognize(points.map(QPoint.init)) {
                                     if let shortcut = shortcuts.first(where: { $0.id == match.id }) {
-                                        recognizedShortcut = shortcut
-                                        if quickNavigate {
-                                            // Navigate immediately
-                                            withAnimation(.easeOut(duration: 0.3)) {
-                                                trailOpacity = 0
-                                            }
-                                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                                                onNavigate(shortcut.url)
-                                                resetState()
-                                            }
-                                        } else {
-                                            // Show result briefly
-                                            withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
-                                                showResult = true
-                                                resultScale = 1.0
-                                            }
-                                            withAnimation(.easeOut(duration: 0.4)) {
-                                                trailOpacity = 0.3
-                                            }
-                                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.9) {
-                                                onNavigate(shortcut.url)
-                                                resetState()
-                                            }
+                                        // Navigate immediately
+                                        withAnimation(.easeOut(duration: 0.3)) {
+                                            trailOpacity = 0
+                                        }
+                                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                                            onNavigate(shortcut.url)
+                                            resetState()
                                         }
                                     } else {
                                         fadeOutTrail()
@@ -507,24 +484,6 @@ struct GestureCanvasView: View {
                         // Draw sparkle dots along the path
                         drawSparkles(context: &context, points: points)
                     }
-                    .allowsHitTesting(false)
-                }
-
-                // Recognition result overlay
-                if showResult, let shortcut = recognizedShortcut {
-                    VStack(spacing: 8) {
-                        GestureThumbnail(points: shortcut.samples.first ?? [], color: trailColor)
-                            .frame(width: 36, height: 36)
-                        Text(shortcut.label)
-                            .font(.system(size: 16, weight: .semibold, design: .rounded))
-                            .foregroundStyle(Color.darkText)
-                    }
-                    .padding(20)
-                    .background(
-                        RoundedRectangle(cornerRadius: 16)
-                            .fill(.ultraThinMaterial)
-                    )
-                    .scaleEffect(resultScale)
                     .allowsHitTesting(false)
                 }
             }
@@ -605,9 +564,6 @@ struct GestureCanvasView: View {
     private func resetState() {
         points = []
         isDrawing = false
-        recognizedShortcut = nil
-        showResult = false
         trailOpacity = 1.0
-        resultScale = 0.5
     }
 }

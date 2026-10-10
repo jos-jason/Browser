@@ -16,6 +16,8 @@ extension Color {
     static let creamBackground = Color(red: 0.96, green: 0.94, blue: 0.91)
     static let tealAccent = Color(red: 0.35, green: 0.67, blue: 0.64)
     static let darkText = Color(red: 0.2, green: 0.2, blue: 0.2)
+    /// Search bar outline, dots and typed text share this so they read as one piece
+    static let searchBarInk = Color.darkText.opacity(0.75)
     static let settingsAccent = Color(red: 0.847, green: 0.541, blue: 0.102)
 }
 
@@ -247,7 +249,7 @@ class BrowserTab: Identifiable {
     let navigator: WebViewNavigator
     let webView: WKWebView
     let delegate: BrowserTabDelegate
-    private var urlObservation: NSKeyValueObservation?
+    private var observations: [NSKeyValueObservation] = []
 
     init(url: URL, contentBlocker: ContentBlocker) {
         self.currentURL = url
@@ -273,12 +275,20 @@ class BrowserTab: Identifiable {
         // Set back-reference so delegate can update this tab
         del.tab = self
 
-        // Catch URL changes that don't trigger a navigation (e.g. YouTube, Reddit page changes)
-        urlObservation = wk.observe(\.url, options: [.new]) { [weak self] webView, _ in
-            MainActor.assumeIsolated {
-                if let url = webView.url { self?.currentURL = url }
-            }
-        }
+        // Catch URL and history changes that don't trigger a full navigation (e.g. YouTube, Reddit)
+        observations = [
+            wk.observe(\.url, options: [.new]) { [weak self] webView, _ in
+                MainActor.assumeIsolated {
+                    if let url = webView.url { self?.currentURL = url }
+                }
+            },
+            wk.observe(\.canGoBack, options: [.new]) { [weak self] webView, _ in
+                MainActor.assumeIsolated { self?.navigator.canGoBack = webView.canGoBack }
+            },
+            wk.observe(\.canGoForward, options: [.new]) { [weak self] webView, _ in
+                MainActor.assumeIsolated { self?.navigator.canGoForward = webView.canGoForward }
+            },
+        ]
 
         wk.load(URLRequest(url: url))
     }
@@ -789,6 +799,7 @@ struct ContentView: View {
                     HStack(spacing: 0) {
                         TextField("Search or enter URL...", text: $searchText)
                             .focused($isSearchFocused)
+                            .foregroundStyle(Color.searchBarInk)
                             .padding(14)
                             .autocorrectionDisabled()
                             .textInputAutocapitalization(.never)
@@ -803,7 +814,7 @@ struct ContentView: View {
                             gap2Start: 0.55,
                             gapSize: 0.10,
                             lineWidth: 2.5,
-                            borderColor: Color.darkText.opacity(0.75),
+                            borderColor: Color.searchBarInk,
                             fillColor: Color(red: 0.94, green: 0.92, blue: 0.88),
                             drawDots: false
                         )
@@ -814,7 +825,7 @@ struct ContentView: View {
                             gap1Start: 0.05,
                             gap2Start: 0.55,
                             gapSize: 0.10,
-                            dotColor: Color.darkText.opacity(0.75),
+                            dotColor: Color.searchBarInk,
                             inset: 6
                         )
                         .padding(-6)
@@ -924,6 +935,7 @@ struct BrowserView: View {
     @State private var showFullURL = false
     @State private var didCopyURL = false
     @State private var urlBarText = ""
+    @State private var isKeyboardVisible = false
     @FocusState private var isSearchFocused: Bool
     @FocusState private var isURLBarFocused: Bool
     @AppStorage("searchEngine") private var searchEngine: String = SearchEngine.brave.rawValue
@@ -956,8 +968,19 @@ struct BrowserView: View {
                     if researchMode {
                         tabStrip()
                     }
+
+                    bottomToolbar(tab: activeTab)
                 }
+                // Let the bottom toolbar reach down beside the home indicator so it stays slim
+                // (.container only, so it still rises above the keyboard)
+                .ignoresSafeArea(.container, edges: .bottom)
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
+            isKeyboardVisible = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
+            isKeyboardVisible = false
         }
         .onAppear {
             if tabManager.tabs.isEmpty {
@@ -1087,6 +1110,67 @@ struct BrowserView: View {
         .padding(.horizontal)
         .padding(.vertical, 10)
         .background(.white)
+    }
+
+    // MARK: - Bottom Toolbar
+
+    @ViewBuilder
+    private func bottomToolbar(tab: BrowserTab) -> some View {
+        HStack {
+            Button {
+                tab.navigator.goBack()
+            } label: {
+                bottomToolbarIcon("chevron.left", enabled: tab.navigator.canGoBack)
+            }
+            .disabled(!tab.navigator.canGoBack)
+
+            Spacer()
+
+            Button {
+                tab.navigator.goForward()
+            } label: {
+                bottomToolbarIcon("chevron.right", enabled: tab.navigator.canGoForward)
+            }
+            .disabled(!tab.navigator.canGoForward)
+
+            Spacer()
+
+            if isKeyboardVisible {
+                // Lower the keyboard (also for fields on the web page) and close the search bar
+                Button {
+                    isURLBarFocused = false
+                    UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        showFullURL = false
+                    }
+                } label: {
+                    bottomToolbarIcon("chevron.down", enabled: true)
+                }
+            } else {
+                // Open the top search bar, empty and ready to type
+                Button {
+                    urlBarText = ""
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        showFullURL = true
+                    }
+                    isURLBarFocused = true
+                } label: {
+                    bottomToolbarIcon("magnifyingglass", enabled: true)
+                }
+            }
+        }
+        .padding(.horizontal, 40)
+        .padding(.top, 6)
+        .padding(.bottom, isKeyboardVisible ? 6 : 16) // clear the home indicator
+        .background(Color.white.ignoresSafeArea(edges: .bottom)) // matches the top toolbar
+    }
+
+    private func bottomToolbarIcon(_ systemName: String, enabled: Bool) -> some View {
+        Image(systemName: systemName)
+            .font(.system(size: 18, weight: .semibold))
+            .foregroundStyle(Color.darkText.opacity(enabled ? 0.6 : 0.3))
+            .frame(width: 44, height: 24)
+            .contentShape(Rectangle())
     }
 
     // MARK: - Full URL Panel
@@ -1295,6 +1379,7 @@ struct BrowserView: View {
         HStack(spacing: 0) {
             TextField("Search or enter URL...", text: $searchText)
                 .focused($isSearchFocused)
+                .foregroundStyle(Color.searchBarInk)
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
                 .autocorrectionDisabled()
@@ -1333,7 +1418,7 @@ struct BrowserView: View {
                 gap2Start: 0.55,
                 gapSize: 0.10,
                 lineWidth: 2.5,
-                borderColor: Color.darkText.opacity(0.75),
+                borderColor: Color.searchBarInk,
                 fillColor: Color(red: 0.97, green: 0.96, blue: 0.94),
                 drawDots: false
             )
@@ -1344,7 +1429,7 @@ struct BrowserView: View {
                 gap1Start: 0.05,
                 gap2Start: 0.55,
                 gapSize: 0.10,
-                dotColor: Color.darkText.opacity(0.75),
+                dotColor: Color.searchBarInk,
                 inset: 6
             )
             .padding(-6)
@@ -1455,6 +1540,7 @@ struct BrowserView: View {
         HStack(spacing: 0) {
             TextField("Search or enter URL...", text: text, axis: .vertical)
                 .lineLimit(1...5)
+                .foregroundStyle(Color.searchBarInk)
                 .focused(focus)
                 // A wrapping field types a newline on Return — treat it as Go instead
                 .onChange(of: text.wrappedValue) { _, newValue in
@@ -1501,7 +1587,7 @@ struct BrowserView: View {
                 gap2Start: 0.55,
                 gapSize: 0.10,
                 lineWidth: 2.5,
-                borderColor: Color.darkText.opacity(0.75),
+                borderColor: Color.searchBarInk,
                 fillColor: Color(red: 0.97, green: 0.96, blue: 0.94),
                 drawDots: false
             )
@@ -1512,7 +1598,7 @@ struct BrowserView: View {
                 gap1Start: 0.05,
                 gap2Start: 0.55,
                 gapSize: 0.10,
-                dotColor: Color.darkText.opacity(0.75),
+                dotColor: Color.searchBarInk,
                 inset: 6
             )
             .padding(-6)
@@ -1601,7 +1687,6 @@ struct SettingsView: View {
     @AppStorage("searchEngine") private var searchEngine: String = SearchEngine.brave.rawValue
     @AppStorage("researchMode") private var researchMode = false
     @AppStorage("gestureShortcutsEnabled") private var gestureShortcutsEnabled = true
-    @AppStorage("gestureQuickNavigate") private var gestureQuickNavigate = false
     @State private var currentIcon: AppIconOption = AppIconOption.current
     @State private var gestureShortcuts: [GestureShortcut] = GestureStore.load()
     @State private var editingGesture: EditingGesture? = nil
@@ -1814,30 +1899,6 @@ struct SettingsView: View {
                         )
 
                         if gestureShortcutsEnabled {
-                            // Quick navigate toggle
-                            HStack {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text("Quick Navigate")
-                                        .font(.system(size: 17, weight: .medium, design: .rounded))
-                                        .foregroundStyle(Color.darkText)
-                                    Text("Skip confirmation, go immediately")
-                                        .font(.system(size: 13, weight: .regular, design: .rounded))
-                                        .foregroundStyle(Color.darkText.opacity(0.5))
-                                }
-
-                                Spacer()
-
-                                Toggle("", isOn: $gestureQuickNavigate)
-                                    .tint(Color.tealAccent)
-                                    .labelsHidden()
-                            }
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 14)
-                            .background(
-                                RoundedRectangle(cornerRadius: 10)
-                                    .fill(Color(red: 0.94, green: 0.92, blue: 0.88))
-                            )
-
                             // Gesture list — tap to edit, draw samples, or change the site
                             VStack(spacing: 0) {
                                 ForEach(gestureShortcuts) { shortcut in
