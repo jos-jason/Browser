@@ -8,6 +8,7 @@
 import SwiftUI
 import WebKit
 import Photos
+import UniformTypeIdentifiers
 
 // MARK: - Color Palette
 
@@ -15,6 +16,8 @@ extension Color {
     static let creamBackground = Color(red: 0.96, green: 0.94, blue: 0.91)
     static let tealAccent = Color(red: 0.35, green: 0.67, blue: 0.64)
     static let darkText = Color(red: 0.2, green: 0.2, blue: 0.2)
+    /// Search bar outline, dots and typed text share this so they read as one piece
+    static let searchBarInk = Color.darkText.opacity(0.75)
     static let settingsAccent = Color(red: 0.847, green: 0.541, blue: 0.102)
 }
 
@@ -233,10 +236,20 @@ class BrowserTab: Identifiable {
     let id = UUID()
     var currentURL: URL
     var title: String = ""
+    /// Why the last page failed to load (nil when it loaded fine)
+    var loadError: String?
+    /// The address that failed, so the user can correct it
+    var failedURL: URL?
+
+    /// Blank or error pages get the address bar opened automatically
+    var needsAddressBar: Bool {
+        loadError != nil || currentURL.absoluteString == "about:blank"
+    }
     var snapshot: UIImage?
     let navigator: WebViewNavigator
     let webView: WKWebView
     let delegate: BrowserTabDelegate
+    private var observations: [NSKeyValueObservation] = []
 
     init(url: URL, contentBlocker: ContentBlocker) {
         self.currentURL = url
@@ -262,6 +275,21 @@ class BrowserTab: Identifiable {
         // Set back-reference so delegate can update this tab
         del.tab = self
 
+        // Catch URL and history changes that don't trigger a full navigation (e.g. YouTube, Reddit)
+        observations = [
+            wk.observe(\.url, options: [.new]) { [weak self] webView, _ in
+                MainActor.assumeIsolated {
+                    if let url = webView.url { self?.currentURL = url }
+                }
+            },
+            wk.observe(\.canGoBack, options: [.new]) { [weak self] webView, _ in
+                MainActor.assumeIsolated { self?.navigator.canGoBack = webView.canGoBack }
+            },
+            wk.observe(\.canGoForward, options: [.new]) { [weak self] webView, _ in
+                MainActor.assumeIsolated { self?.navigator.canGoForward = webView.canGoForward }
+            },
+        ]
+
         wk.load(URLRequest(url: url))
     }
 
@@ -278,6 +306,8 @@ class BrowserTab: Identifiable {
 // Delegate owned by BrowserTab so it's active from the moment the web view is created
 class BrowserTabDelegate: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate {
     weak var tab: BrowserTab?
+    /// HTTP status of the main page being loaded, checked once it commits
+    private var pendingHTTPStatus: Int?
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         guard let tab else { return }
@@ -292,6 +322,36 @@ class BrowserTabDelegate: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownlo
         tab.navigator.canGoBack = webView.canGoBack
         tab.navigator.canGoForward = webView.canGoForward
         tab.currentURL = webView.url ?? tab.currentURL
+
+        // The site answered, but with an error page (404, 500, ...)
+        if let status = pendingHTTPStatus, status >= 400 {
+            tab.loadError = "The site returned an error (\(status) \(HTTPURLResponse.localizedString(forStatusCode: status).capitalized))."
+            tab.failedURL = webView.url
+        } else {
+            tab.loadError = nil
+            tab.failedURL = nil
+        }
+        pendingHTTPStatus = nil
+    }
+
+    // Couldn't reach the page at all (no internet, bad address, ...)
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        recordFailure(error, in: webView)
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        recordFailure(error, in: webView)
+    }
+
+    private func recordFailure(_ error: Error, in webView: WKWebView) {
+        guard let tab else { return }
+        let nsError = error as NSError
+        // Not real failures: a navigation that was replaced/cancelled, or one that became a download
+        if nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled { return }
+        if nsError.domain == "WebKitErrorDomain" && nsError.code == 102 { return }
+
+        tab.loadError = nsError.localizedDescription
+        tab.failedURL = (nsError.userInfo[NSURLErrorFailingURLErrorKey] as? URL) ?? webView.url
     }
 
     // Upgrade http:// to https:// to satisfy App Transport Security
@@ -303,18 +363,71 @@ class BrowserTabDelegate: NSObject, WKNavigationDelegate, WKUIDelegate, WKDownlo
         return url
     }
 
+    // Some sites (e.g. audible.com) run a browser-compatibility check that fails
+    // silently when the UA lacks the "Safari/" token WKWebView omits by default,
+    // which stops parts of the page (like the header nav) from rendering at all.
+    // Scoped to just those domains, since presenting as full Safari everywhere
+    // can make other sites' fraud/session heuristics (e.g. Amazon's "keep me
+    // signed in") distrust the session and stop persisting login.
+    private static let safariSpoofDomains = ["audible.com"]
+
+    private static let spoofedSafariUA: String = {
+        let osVersion = ProcessInfo.processInfo.operatingSystemVersion
+        let versionString = "\(osVersion.majorVersion)_\(osVersion.minorVersion)"
+        return "Mozilla/5.0 (iPhone; CPU iPhone OS \(versionString) like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/\(osVersion.majorVersion).\(osVersion.minorVersion) Mobile/15E148 Safari/604.1"
+    }()
+
+    private func desiredUserAgent(for host: String?) -> String? {
+        guard let host else { return nil }
+        let needsSpoof = Self.safariSpoofDomains.contains { host == $0 || host.hasSuffix(".\($0)") }
+        return needsSpoof ? Self.spoofedSafariUA : nil
+    }
+
     // Handle regular navigation — upgrade insecure URLs
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
-        if let url = navigationAction.request.url, url.scheme == "http" {
+        guard let url = navigationAction.request.url else {
+            decisionHandler(.allow)
+            return
+        }
+
+        // webView.load(_:) always targets the main frame, so cancel-and-reissue
+        // tricks below must only run for main-frame navigations — doing this for
+        // a subframe/iframe request (e.g. an ad iframe) would blow away the whole
+        // page and replace it with that iframe's URL.
+        guard navigationAction.targetFrame?.isMainFrame == true else {
+            decisionHandler(.allow)
+            return
+        }
+
+        if url.scheme == "http" {
             decisionHandler(.cancel)
             webView.load(URLRequest(url: upgradeToHTTPS(url)))
             return
         }
+
+        // customUserAgent only takes effect starting with the *next* navigation,
+        // not the one currently being decided — so when it needs to change,
+        // cancel this navigation and reissue it once the UA is set.
+        // Note: the getter reads back "" (not nil) once any value has ever been
+        // set, so nil and "" must be treated as equivalent here, or this becomes
+        // an infinite cancel/reload loop for every non-spoofed site.
+        let currentUA = webView.customUserAgent.flatMap { $0.isEmpty ? nil : $0 }
+        let desiredUA = desiredUserAgent(for: url.host)
+        if currentUA != desiredUA {
+            webView.customUserAgent = desiredUA
+            decisionHandler(.cancel)
+            webView.load(URLRequest(url: url))
+            return
+        }
+
         decisionHandler(.allow)
     }
 
     // Convert non-renderable responses (e.g. Content-Disposition: attachment) into downloads
     func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse, decisionHandler: @escaping (WKNavigationResponsePolicy) -> Void) {
+        if navigationResponse.isForMainFrame {
+            pendingHTTPStatus = (navigationResponse.response as? HTTPURLResponse)?.statusCode
+        }
         if !navigationResponse.canShowMIMEType {
             decisionHandler(.download)
             return
@@ -648,6 +761,8 @@ struct ContentView: View {
     @AppStorage("searchEngine") private var searchEngine: String = SearchEngine.brave.rawValue
     @State private var screenHeight: CGFloat = 0
     @State private var contentBlocker = ContentBlocker()
+    @AppStorage("gestureShortcutsEnabled") private var gestureShortcutsEnabled = true
+    @State private var gestureShortcuts: [GestureShortcut] = GestureStore.load()
 
     var body: some View {
         ZStack {
@@ -684,6 +799,7 @@ struct ContentView: View {
                     HStack(spacing: 0) {
                         TextField("Search or enter URL...", text: $searchText)
                             .focused($isSearchFocused)
+                            .foregroundStyle(Color.searchBarInk)
                             .padding(14)
                             .autocorrectionDisabled()
                             .textInputAutocapitalization(.never)
@@ -698,7 +814,7 @@ struct ContentView: View {
                             gap2Start: 0.55,
                             gapSize: 0.10,
                             lineWidth: 2.5,
-                            borderColor: Color.darkText.opacity(0.75),
+                            borderColor: Color.searchBarInk,
                             fillColor: Color(red: 0.94, green: 0.92, blue: 0.88),
                             drawDots: false
                         )
@@ -709,7 +825,7 @@ struct ContentView: View {
                             gap1Start: 0.05,
                             gap2Start: 0.55,
                             gapSize: 0.10,
-                            dotColor: Color.darkText.opacity(0.75),
+                            dotColor: Color.searchBarInk,
                             inset: 6
                         )
                         .padding(-6)
@@ -742,6 +858,23 @@ struct ContentView: View {
 
                 Spacer()
             }
+
+            // Gesture drawing canvas — fills the whole screen but is invisible
+            if gestureShortcutsEnabled {
+                VStack {
+                    // Leave space for the top bar + search area so drawing only happens below
+                    Spacer()
+                        .frame(height: screenHeight / 2 + 20)
+
+                    GestureCanvasView(
+                        shortcuts: gestureShortcuts,
+                        onNavigate: { url in
+                            webItem = IdentifiableURL(url: url)
+                        }
+                    )
+                }
+                .ignoresSafeArea(.keyboard)
+            }
         }
         .ignoresSafeArea(.keyboard)
         .overlay(
@@ -761,7 +894,9 @@ struct ContentView: View {
                 webItem = nil
             }
         }
-        .sheet(isPresented: $isShowingSettings) {
+        .sheet(isPresented: $isShowingSettings, onDismiss: {
+            gestureShortcuts = GestureStore.load()
+        }) {
             SettingsView(contentBlocker: contentBlocker)
         }
     }
@@ -797,7 +932,12 @@ struct BrowserView: View {
 
     @State private var tabManager = TabManager()
     @State private var searchText = ""
+    @State private var showFullURL = false
+    @State private var didCopyURL = false
+    @State private var urlBarText = ""
+    @State private var isKeyboardVisible = false
     @FocusState private var isSearchFocused: Bool
+    @FocusState private var isURLBarFocused: Bool
     @AppStorage("searchEngine") private var searchEngine: String = SearchEngine.brave.rawValue
     @AppStorage("researchMode") private var researchMode = false
 
@@ -815,6 +955,12 @@ struct BrowserView: View {
             if let activeTab = tabManager.activeTab {
                 VStack(spacing: 0) {
                     topToolbar(tab: activeTab)
+                        .zIndex(1) // URL panel slides out from underneath
+
+                    if showFullURL {
+                        fullURLPanel(tab: activeTab)
+                            .transition(.move(edge: .top).combined(with: .opacity))
+                    }
 
                     TabWebView(tab: activeTab)
                         .id(activeTab.id)
@@ -823,14 +969,33 @@ struct BrowserView: View {
                         tabStrip()
                     }
 
-                    bottomSearchBar(tab: activeTab)
+                    bottomToolbar(tab: activeTab)
                 }
+                // Let the bottom toolbar reach down beside the home indicator so it stays slim
+                // (.container only, so it still rises above the keyboard)
+                .ignoresSafeArea(.container, edges: .bottom)
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
+            isKeyboardVisible = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
+            isKeyboardVisible = false
         }
         .onAppear {
             if tabManager.tabs.isEmpty {
                 tabManager.addTab(url: initialURL, contentBlocker: contentBlocker)
             }
+        }
+        // Open the address bar on blank/error pages (also re-checked when switching tabs)
+        .onChange(of: tabManager.activeTab.map { "\($0.id)|\($0.needsAddressBar)|\($0.failedURL?.absoluteString ?? "")" }) {
+            guard let tab = tabManager.activeTab, tab.needsAddressBar else { return }
+            urlBarText = tab.failedURL.map(Self.readableURL)
+                ?? (tab.currentURL.absoluteString == "about:blank" ? "" : Self.readableURL(tab.currentURL))
+            withAnimation(.easeInOut(duration: 0.2)) {
+                showFullURL = true
+            }
+            isURLBarFocused = true
         }
         .overlay {
             if researchMode && tabManager.showTabSwitcher {
@@ -895,10 +1060,27 @@ struct BrowserView: View {
 
             Spacer()
 
-            Text(tab.currentURL.host ?? "")
+            // Tap the domain to see the full URL
+            Button {
+                if !showFullURL {
+                    urlBarText = Self.readableURL(tab.currentURL)
+                } else {
+                    isURLBarFocused = false
+                }
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    showFullURL.toggle()
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Text(tab.currentURL.host ?? "")
+                        .lineLimit(1)
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 9, weight: .bold))
+                        .rotationEffect(.degrees(showFullURL ? 180 : 0))
+                }
                 .font(.system(size: 13, weight: .medium, design: .rounded))
                 .foregroundStyle(Color.darkText.opacity(0.6))
-                .lineLimit(1)
+            }
 
             Spacer()
 
@@ -928,6 +1110,128 @@ struct BrowserView: View {
         .padding(.horizontal)
         .padding(.vertical, 10)
         .background(.white)
+    }
+
+    // MARK: - Bottom Toolbar
+
+    @ViewBuilder
+    private func bottomToolbar(tab: BrowserTab) -> some View {
+        HStack {
+            Button {
+                tab.navigator.goBack()
+            } label: {
+                bottomToolbarIcon("chevron.left", enabled: tab.navigator.canGoBack)
+            }
+            .disabled(!tab.navigator.canGoBack)
+
+            Spacer()
+
+            Button {
+                tab.navigator.goForward()
+            } label: {
+                bottomToolbarIcon("chevron.right", enabled: tab.navigator.canGoForward)
+            }
+            .disabled(!tab.navigator.canGoForward)
+
+            Spacer()
+
+            if isKeyboardVisible {
+                // Lower the keyboard (also for fields on the web page) and close the search bar
+                Button {
+                    isURLBarFocused = false
+                    UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        showFullURL = false
+                    }
+                } label: {
+                    bottomToolbarIcon("chevron.down", enabled: true)
+                }
+            } else {
+                // Open the top search bar, empty and ready to type
+                Button {
+                    urlBarText = ""
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        showFullURL = true
+                    }
+                    isURLBarFocused = true
+                } label: {
+                    bottomToolbarIcon("magnifyingglass", enabled: true)
+                }
+            }
+        }
+        .padding(.horizontal, 40)
+        .padding(.top, 6)
+        .padding(.bottom, isKeyboardVisible ? 6 : 16) // clear the home indicator
+        .background(Color.white.ignoresSafeArea(edges: .bottom)) // matches the top toolbar
+    }
+
+    private func bottomToolbarIcon(_ systemName: String, enabled: Bool) -> some View {
+        Image(systemName: systemName)
+            .font(.system(size: 18, weight: .semibold))
+            .foregroundStyle(Color.darkText.opacity(enabled ? 0.6 : 0.3))
+            .frame(width: 44, height: 24)
+            .contentShape(Rectangle())
+    }
+
+    // MARK: - Full URL Panel
+
+    /// Full URL with %20 etc. decoded so it's readable
+    private static func readableURL(_ url: URL) -> String {
+        url.absoluteString.removingPercentEncoding ?? url.absoluteString
+    }
+
+    @ViewBuilder
+    private func fullURLPanel(tab: BrowserTab) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+        HStack(spacing: 10) {
+            searchBar(text: $urlBarText, focus: $isURLBarFocused) {
+                if navigate(tab: tab, input: urlBarText) {
+                    isURLBarFocused = false
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        showFullURL = false
+                    }
+                }
+            }
+
+            Button {
+                UIPasteboard.general.string = tab.currentURL.absoluteString
+                didCopyURL = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                    didCopyURL = false
+                }
+            } label: {
+                Image(systemName: didCopyURL ? "checkmark" : "doc.on.doc")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(Color.tealAccent)
+                    .frame(width: 24, height: 24)
+            }
+        }
+
+            if let error = tab.loadError {
+                Label {
+                    Text("Couldn't open this page. \(error)")
+                } icon: {
+                    Image(systemName: "exclamationmark.triangle")
+                }
+                .font(.system(size: 13, weight: .medium, design: .rounded))
+                .foregroundStyle(Color.orange)
+                .padding(.leading, 4)
+            }
+        }
+        .padding(.leading, 12)
+        .padding(.trailing, 14)
+        .padding(.top, 6)
+        .padding(.bottom, 10)
+        .background(.white)
+        .overlay(alignment: .bottom) {
+            Divider()
+        }
+        // Keep the URL current as the page changes, unless the user is editing it
+        .onChange(of: tab.currentURL) {
+            if !isURLBarFocused && tab.loadError == nil {
+                urlBarText = Self.readableURL(tab.currentURL)
+            }
+        }
     }
 
     // MARK: - Tab Strip
@@ -1075,6 +1379,7 @@ struct BrowserView: View {
         HStack(spacing: 0) {
             TextField("Search or enter URL...", text: $searchText)
                 .focused($isSearchFocused)
+                .foregroundStyle(Color.searchBarInk)
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
                 .autocorrectionDisabled()
@@ -1113,7 +1418,7 @@ struct BrowserView: View {
                 gap2Start: 0.55,
                 gapSize: 0.10,
                 lineWidth: 2.5,
-                borderColor: Color.darkText.opacity(0.75),
+                borderColor: Color.searchBarInk,
                 fillColor: Color(red: 0.97, green: 0.96, blue: 0.94),
                 drawDots: false
             )
@@ -1124,7 +1429,7 @@ struct BrowserView: View {
                 gap1Start: 0.05,
                 gap2Start: 0.55,
                 gapSize: 0.10,
-                dotColor: Color.darkText.opacity(0.75),
+                dotColor: Color.searchBarInk,
                 inset: 6
             )
             .padding(-6)
@@ -1228,20 +1533,31 @@ struct BrowserView: View {
 
     // MARK: - Bottom Search Bar
 
-    @ViewBuilder
-    private func bottomSearchBar(tab: BrowserTab) -> some View {
+    /// The app's search bar style: text field + Go! button inside the gapped dotted border.
+    /// Long text (full URLs) wraps onto multiple lines instead of being cut off.
+    private func searchBar(text: Binding<String>, focus: FocusState<Bool>.Binding,
+                           onGo: @escaping () -> Void) -> some View {
         HStack(spacing: 0) {
-            TextField("Search or enter URL...", text: $searchText)
-                .focused($isSearchFocused)
+            TextField("Search or enter URL...", text: text, axis: .vertical)
+                .lineLimit(1...5)
+                .foregroundStyle(Color.searchBarInk)
+                .focused(focus)
+                // A wrapping field types a newline on Return — treat it as Go instead
+                .onChange(of: text.wrappedValue) { _, newValue in
+                    if newValue.contains("\n") {
+                        text.wrappedValue = newValue.replacingOccurrences(of: "\n", with: "")
+                        onGo()
+                    }
+                }
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
                 .autocorrectionDisabled()
                 .textInputAutocapitalization(.never)
                 .keyboardType(.webSearch)
                 .submitLabel(.go)
-                .onSubmit { goInBrowser(tab: tab) }
+                .onSubmit(onGo)
 
-            Button { goInBrowser(tab: tab) } label: {
+            Button(action: onGo) {
                 Text("Go!")
                     .font(.system(size: 14, weight: .semibold, design: .rounded))
                     .foregroundStyle(.white)
@@ -1271,7 +1587,7 @@ struct BrowserView: View {
                 gap2Start: 0.55,
                 gapSize: 0.10,
                 lineWidth: 2.5,
-                borderColor: Color.darkText.opacity(0.75),
+                borderColor: Color.searchBarInk,
                 fillColor: Color(red: 0.97, green: 0.96, blue: 0.94),
                 drawDots: false
             )
@@ -1282,30 +1598,29 @@ struct BrowserView: View {
                 gap1Start: 0.05,
                 gap2Start: 0.55,
                 gapSize: 0.10,
-                dotColor: Color.darkText.opacity(0.75),
+                dotColor: Color.searchBarInk,
                 inset: 6
             )
             .padding(-6)
             .allowsHitTesting(false)
         )
-        .padding(.horizontal, 12)
-        .padding(.top, 2)
-        .padding(.bottom, 8)
-        .background(.white)
     }
 
     // MARK: - Navigation
 
-    private func goInBrowser(tab: BrowserTab) {
-        isSearchFocused = false
-        let trimmed = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+    /// Loads a URL or search query in the tab. Returns false if there was nothing to load.
+    @discardableResult
+    private func navigate(tab: BrowserTab, input: String) -> Bool {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
 
         var targetURL: URL?
 
-        if trimmed.contains(".") && !trimmed.contains(" ") {
-            let urlString = trimmed.hasPrefix("http") ? trimmed : "https://\(trimmed)"
-            targetURL = URL(string: urlString)
+        if trimmed.hasPrefix("http://") || trimmed.hasPrefix("https://") {
+            // Full URL, possibly with readable spaces from the top bar — re-encode them
+            targetURL = URL(string: trimmed, encodingInvalidCharacters: true)
+        } else if trimmed.contains(".") && !trimmed.contains(" ") {
+            targetURL = URL(string: "https://\(trimmed)")
         }
 
         if targetURL == nil {
@@ -1313,10 +1628,9 @@ struct BrowserView: View {
             targetURL = engine.searchURL(for: trimmed)
         }
 
-        if let url = targetURL {
-            tab.webView.load(URLRequest(url: url))
-            searchText = ""
-        }
+        guard let url = targetURL else { return false }
+        tab.webView.load(URLRequest(url: url))
+        return true
     }
 }
 
@@ -1362,11 +1676,22 @@ enum AppIconOption: String, CaseIterable, Identifiable {
 
 // MARK: - Settings View
 
+private struct EditingGesture: Identifiable {
+    let gesture: GestureShortcut
+    let isNew: Bool
+    var id: String { gesture.id }
+}
+
 struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @AppStorage("searchEngine") private var searchEngine: String = SearchEngine.brave.rawValue
     @AppStorage("researchMode") private var researchMode = false
+    @AppStorage("gestureShortcutsEnabled") private var gestureShortcutsEnabled = true
     @State private var currentIcon: AppIconOption = AppIconOption.current
+    @State private var gestureShortcuts: [GestureShortcut] = GestureStore.load()
+    @State private var editingGesture: EditingGesture? = nil
+    @State private var isImportingGestures = false
+    @State private var gestureImportMessage: String? = nil
     var contentBlocker: ContentBlocker
 
     var body: some View {
@@ -1541,6 +1866,117 @@ struct SettingsView: View {
                     }
                     .padding(.horizontal, 20)
 
+                    // Gesture shortcuts
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("Gesture Shortcuts")
+                            .font(.system(size: 14, weight: .medium, design: .rounded))
+                            .foregroundStyle(Color.darkText.opacity(0.6))
+                            .textCase(.uppercase)
+                            .tracking(1)
+
+                        // Enable/disable toggle
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Gesture Shortcuts")
+                                    .font(.system(size: 17, weight: .medium, design: .rounded))
+                                    .foregroundStyle(Color.darkText)
+                                Text("Draw shapes to open sites")
+                                    .font(.system(size: 13, weight: .regular, design: .rounded))
+                                    .foregroundStyle(Color.darkText.opacity(0.5))
+                            }
+
+                            Spacer()
+
+                            Toggle("", isOn: $gestureShortcutsEnabled)
+                                .tint(Color.tealAccent)
+                                .labelsHidden()
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 14)
+                        .background(
+                            RoundedRectangle(cornerRadius: 10)
+                                .fill(Color(red: 0.94, green: 0.92, blue: 0.88))
+                        )
+
+                        if gestureShortcutsEnabled {
+                            // Gesture list — tap to edit, draw samples, or change the site
+                            VStack(spacing: 0) {
+                                ForEach(gestureShortcuts) { shortcut in
+                                    Button {
+                                        editingGesture = EditingGesture(gesture: shortcut, isNew: false)
+                                    } label: {
+                                        HStack(spacing: 12) {
+                                            GestureThumbnail(points: shortcut.samples.first ?? [])
+                                                .frame(width: 26, height: 26)
+                                                .frame(width: 28)
+
+                                            Text(shortcut.name)
+                                                .font(.system(size: 15, weight: .medium, design: .rounded))
+                                                .foregroundStyle(Color.darkText)
+
+                                            Spacer()
+
+                                            Text(shortcut.label)
+                                                .font(.system(size: 15, weight: .regular, design: .rounded))
+                                                .foregroundStyle(Color.darkText.opacity(0.6))
+
+                                            Image(systemName: "chevron.right")
+                                                .font(.system(size: 12, weight: .medium))
+                                                .foregroundStyle(Color.darkText.opacity(0.3))
+                                        }
+                                    }
+                                    .padding(.horizontal, 16)
+                                    .padding(.vertical, 10)
+
+                                    Divider()
+                                        .padding(.leading, 56)
+                                }
+
+                                Button {
+                                    let blank = GestureShortcut(id: UUID().uuidString, name: "", label: "",
+                                                                url: URL(string: "https://example.com")!, samples: [])
+                                    editingGesture = EditingGesture(gesture: blank, isNew: true)
+                                } label: {
+                                    HStack(spacing: 12) {
+                                        Image(systemName: "plus")
+                                            .font(.system(size: 16, weight: .semibold))
+                                            .frame(width: 28)
+                                        Text("Add Gesture")
+                                            .font(.system(size: 15, weight: .medium, design: .rounded))
+                                        Spacer()
+                                    }
+                                    .foregroundStyle(Color.tealAccent)
+                                }
+                                .padding(.horizontal, 16)
+                                .padding(.vertical, 12)
+                            }
+                            .background(
+                                RoundedRectangle(cornerRadius: 10)
+                                    .fill(Color(red: 0.94, green: 0.92, blue: 0.88))
+                            )
+
+                            // Share gesture sets as JSON
+                            HStack(spacing: 20) {
+                                if let exportURL = GestureStore.exportFile(gestureShortcuts) {
+                                    ShareLink(item: exportURL) {
+                                        Label("Export", systemImage: "square.and.arrow.up")
+                                    }
+                                }
+                                Button {
+                                    isImportingGestures = true
+                                } label: {
+                                    Label("Import", systemImage: "square.and.arrow.down")
+                                }
+                                Spacer()
+                            }
+                            .font(.system(size: 14, weight: .medium, design: .rounded))
+                            .foregroundStyle(Color.tealAccent)
+                            .padding(.horizontal, 4)
+                        }
+                    }
+                    .padding(.horizontal, 20)
+                    .animation(.easeInOut(duration: 0.25), value: gestureShortcutsEnabled)
+
                 }
                 .padding(.top, 24)
                 .padding(.bottom, 32)
@@ -1555,6 +1991,46 @@ struct SettingsView: View {
                     }
                     .foregroundStyle(Color.tealAccent)
                 }
+            }
+            .sheet(item: $editingGesture) { editing in
+                GestureEditorView(
+                    gesture: editing.gesture,
+                    isNew: editing.isNew,
+                    otherGestures: gestureShortcuts.filter { $0.id != editing.gesture.id },
+                    onSave: { saved in
+                        if let i = gestureShortcuts.firstIndex(where: { $0.id == saved.id }) {
+                            gestureShortcuts[i] = saved
+                        } else {
+                            gestureShortcuts.append(saved)
+                        }
+                        GestureStore.save(gestureShortcuts)
+                    },
+                    onDelete: editing.isNew ? nil : {
+                        gestureShortcuts.removeAll { $0.id == editing.gesture.id }
+                        GestureStore.save(gestureShortcuts)
+                    }
+                )
+            }
+            .fileImporter(isPresented: $isImportingGestures, allowedContentTypes: [.json]) { result in
+                guard case .success(let url) = result else { return }
+                let accessing = url.startAccessingSecurityScopedResource()
+                defer { if accessing { url.stopAccessingSecurityScopedResource() } }
+                if let data = try? Data(contentsOf: url), let imported = GestureStore.decode(data) {
+                    gestureShortcuts = GestureStore.merge(imported, into: gestureShortcuts)
+                    GestureStore.save(gestureShortcuts)
+                    gestureImportMessage = "Imported \(imported.count) gesture\(imported.count == 1 ? "" : "s")."
+                } else {
+                    gestureImportMessage = "That file isn't a valid gesture set."
+                }
+            }
+            .alert(
+                gestureImportMessage ?? "",
+                isPresented: Binding(
+                    get: { gestureImportMessage != nil },
+                    set: { if !$0 { gestureImportMessage = nil } }
+                )
+            ) {
+                Button("OK", role: .cancel) {}
             }
         }
     }
